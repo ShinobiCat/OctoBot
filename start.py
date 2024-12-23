@@ -16,17 +16,46 @@
 import sys
 import os
 
-# Add local OctoBot directories to PYTHONPATH
-sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'Async-Channel'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Backtesting'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Commons'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Services'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Evaluators'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Trading'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Tentacles-Manager'))
+# Use os.path to dynamically calculate the project root
+# Going one level up from the current file (start.py) to the project root
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
-from octobot.cli import main
+# List of subdirectories you want to add to PYTHONPATH (adjusted for correct structure)
+directories = [
+    'OctoBot',
+    'Async-Channel',
+    'OctoBot-Backtesting',
+    'OctoBot-Commons',  # This directory is located under the root, not inside OctoBot
+    'OctoBot-Services',
+    'OctoBot-Evaluators',
+    'OctoBot-Trading',
+    'OctoBot-Tentacles-Manager'
+]
 
+# Debug: Print the root project directory
+print(f"Project root directory: {project_root}")
+
+# Add each directory to sys.path and debug
+for directory in directories:
+    dir_path = os.path.join(project_root, directory)
+    if os.path.exists(dir_path):
+        sys.path.append(dir_path)
+        print(f"Added to sys.path: {dir_path}")  # Debug print for added directories
+    else:
+        print(f"Directory not found: {dir_path}")  # Debug print if directory is not found
+
+# Debug: Print the current sys.path after adding directories
+print("\nCurrent sys.path:")
+for path in sys.path:
+    print(path)
+
+# Try to import the required module and debug
+try:
+    from octobot.cli import main
+    print("\nSuccessfully imported 'octobot.cli.main'")  # Debug print if import is successful
+except ModuleNotFoundError as e:
+    print(f"\nERROR: {e}")  # Debug print if there is an error importing the module
+
+# Ensure that the main function is called if the import is successful
 if __name__ == '__main__':
     main(sys.argv[1:])
