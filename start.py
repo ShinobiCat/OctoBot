@@ -14,6 +14,17 @@
 #  You should have received a copy of the GNU General Public
 #  License along with OctoBot. If not, see <https://www.gnu.org/licenses/>.
 import sys
+import os
+
+# Add local OctoBot directories to PYTHONPATH
+sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'Async-Channel'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Backtesting'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Commons'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Services'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Evaluators'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Trading'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'OctoBot-Tentacles-Manager'))
 
 from octobot.cli import main
 
