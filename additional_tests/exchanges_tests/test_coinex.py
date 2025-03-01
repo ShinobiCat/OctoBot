@@ -31,7 +31,10 @@ class TestCoinExAuthenticatedExchange(
     SYMBOL = f"{ORDER_CURRENCY}/{SETTLEMENT_CURRENCY}"
     ORDER_SIZE = 70  # % of portfolio to include in test orders
     CONVERTS_ORDER_SIZE_BEFORE_PUSHING_TO_EXCHANGES = True
+    EXPECTED_GENERATED_ACCOUNT_ID = True   # set True when account_id can't be fetch and a generated account id is used
+    IS_AUTHENTICATED_REQUEST_CHECK_AVAILABLE = True    # set True when is_authenticated_request is implemented
     VALID_ORDER_ID = "1777764898965454848"
+    USE_ORDER_OPERATION_TO_CHECK_API_KEY_RIGHTS = True
 
     async def test_get_portfolio(self):
         await super().test_get_portfolio()
@@ -39,9 +42,11 @@ class TestCoinExAuthenticatedExchange(
     async def test_get_portfolio_with_market_filter(self):
         await super().test_get_portfolio_with_market_filter()
 
+    async def test_untradable_symbols(self):
+        await super().test_untradable_symbols()
+
     async def test_get_account_id(self):
-        # pass if not implemented
-        pass
+        await super().test_get_account_id()
 
     async def test_is_authenticated_request(self):
         await super().test_is_authenticated_request()
@@ -50,17 +55,23 @@ class TestCoinExAuthenticatedExchange(
         await super().test_invalid_api_key_error()
 
     async def test_get_api_key_permissions(self):
+        await super().test_get_api_key_permissions()
+
+    async def test_missing_trading_api_key_permissions(self):
         # pass if not implemented
         pass
 
-    async def test_missing_trading_api_key_permissions(self):
-        pass
+    async def test_api_key_ip_whitelist_error(self):
+        await super().test_api_key_ip_whitelist_error()
 
     async def test_get_not_found_order(self):
         await super().test_get_not_found_order()
 
     async def test_is_valid_account(self):
         await super().test_is_valid_account()
+
+    async def test_get_special_orders(self):
+        await super().test_get_special_orders()
 
     async def test_create_and_cancel_limit_orders(self):
         await super().test_create_and_cancel_limit_orders()

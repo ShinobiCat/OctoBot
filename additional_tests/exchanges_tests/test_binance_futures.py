@@ -15,6 +15,7 @@
 #  License along with OctoBot. If not, see <https://www.gnu.org/licenses/>.
 import pytest
 
+import octobot_trading.enums
 from additional_tests.exchanges_tests import abstract_authenticated_future_exchange_tester, \
     abstract_authenticated_exchange_tester
 
@@ -28,7 +29,7 @@ class TestBinanceFuturesAuthenticatedExchange(
     # enter exchange name as a class variable here
     EXCHANGE_NAME = "binance"
     CREDENTIALS_EXCHANGE_NAME = "BINANCE_FUTURES"
-    ORDER_CURRENCY = "BTC"
+    ORDER_CURRENCY = "BTC"  # always use a contract that has a size different from 1 unit of the currency
     SETTLEMENT_CURRENCY = "USDC"
     SYMBOL = f"{ORDER_CURRENCY}/{SETTLEMENT_CURRENCY}:{SETTLEMENT_CURRENCY}"
     INVERSE_SYMBOL = f"{ORDER_CURRENCY}/USD:{ORDER_CURRENCY}"
@@ -38,6 +39,38 @@ class TestBinanceFuturesAuthenticatedExchange(
     EXPECTED_QUOTE_MIN_ORDER_SIZE = 200   # min quote value of orders to create (used to check market status parsing)
     IS_AUTHENTICATED_REQUEST_CHECK_AVAILABLE = True    # set True when is_authenticated_request is implemented
 
+    SPECIAL_ORDER_TYPES_BY_EXCHANGE_ID: dict[
+        str, (
+            str, # symbol
+            str, # order type key in 'info' dict
+            str, # order type found in 'info' dict
+            str, # parsed trading_enums.TradeOrderType
+            str, # parsed trading_enums.TradeOrderSide
+            bool, # trigger above (on higher price than order price)
+        )
+    ] = {
+        "4075521283": (
+            "BTC/USDT:USDT", "type", "TAKE_PROFIT_MARKET",
+            octobot_trading.enums.TradeOrderType.LIMIT.value, octobot_trading.enums.TradeOrderSide.SELL.value, True
+        ),
+        '622529': (
+            "BTC/USDC:USDC", "type", "STOP_MARKET",
+            octobot_trading.enums.TradeOrderType.STOP_LOSS.value, octobot_trading.enums.TradeOrderSide.SELL.value, False
+        ),
+        '4076521927': (
+            "BTC/USDT:USDT", "type", "TAKE_PROFIT",
+            octobot_trading.enums.TradeOrderType.LIMIT.value, octobot_trading.enums.TradeOrderSide.BUY.value, False
+        ),
+        '4076521976': (
+            "BTC/USDT:USDT", "type", "STOP",
+            octobot_trading.enums.TradeOrderType.STOP_LOSS.value, octobot_trading.enums.TradeOrderSide.SELL.value, False
+        ),
+    }  # stop loss / take profit and other special order types to be successfully parsed
+    # details of an order that exists but can"t be cancelled
+    UNCANCELLABLE_ORDER_ID_SYMBOL_TYPE: tuple[str, str, octobot_trading.enums.TraderOrderType] = (
+        "4076521927", "BTC/USDT:USDT", octobot_trading.enums.TraderOrderType.BUY_LIMIT.value
+    )
+
     async def _set_account_types(self, account_types):
         # todo remove this and use both types when exchange-side multi portfolio is enabled
         self.exchange_manager.exchange._futures_account_types = account_types
@@ -46,8 +79,10 @@ class TestBinanceFuturesAuthenticatedExchange(
         await super().test_get_portfolio()
 
     async def test_get_portfolio_with_market_filter(self):
-        # pass if not implemented
-        pass
+        await super().test_get_portfolio_with_market_filter()   # can have small variations failing the test when positions are open
+
+    async def test_untradable_symbols(self):
+        await super().test_untradable_symbols()
 
     async def test_get_account_id(self):
         await super().test_get_account_id()
@@ -59,11 +94,13 @@ class TestBinanceFuturesAuthenticatedExchange(
         await super().test_invalid_api_key_error()
 
     async def test_get_api_key_permissions(self):
-        # pass if not implemented
-        pass
+        await super().test_get_api_key_permissions()
 
     async def test_missing_trading_api_key_permissions(self):
         pass
+
+    async def test_api_key_ip_whitelist_error(self):
+        await super().test_api_key_ip_whitelist_error()
 
     async def test_get_not_found_order(self):
         await super().test_get_not_found_order()
@@ -87,6 +124,9 @@ class TestBinanceFuturesAuthenticatedExchange(
 
     async def test_is_valid_account(self):
         await super().test_is_valid_account()
+
+    async def test_get_special_orders(self):
+        await super().test_get_special_orders()
 
     async def test_create_and_cancel_limit_orders(self):
         await super().test_create_and_cancel_limit_orders()

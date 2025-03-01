@@ -172,6 +172,8 @@ class OrderKeys(enum.Enum):
     SYMBOL = "symbol"
     TYPE = "type"
     CHAINED = "chained"
+    SIDE = "side"
+    TRIGGER_ABOVE = "trigger_above"
 
 
 class PositionKeys(enum.Enum):
@@ -180,6 +182,7 @@ class PositionKeys(enum.Enum):
     POSITION_ID = "position_id"
     # subset of octobot_trading.enums.ExchangeConstantsPositionColumns
     SYMBOL = "symbol"
+    LOCAL_ID = "local_id"
     ENTRY_PRICE = "entry_price"
     MARK_PRICE = "mark_price"
     LIQUIDATION_PRICE = "liquidation_price"

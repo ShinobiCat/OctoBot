@@ -16,6 +16,7 @@
 import asyncio
 import contextlib
 import decimal
+import random
 import time
 import typing
 import ccxt
@@ -25,10 +26,12 @@ import pytest
 import octobot_commons.constants as constants
 import octobot_commons.enums as commons_enums
 import octobot_commons.symbols as symbols
+import octobot_commons.configuration as commons_configuration
 import octobot_trading.errors as trading_errors
 import octobot_trading.enums as trading_enums
 import octobot_trading.constants as trading_constants
 import octobot_trading.exchanges as trading_exchanges
+import octobot_trading.exchanges.connectors.ccxt.constants as ccxt_constants
 import octobot_trading.personal_data as personal_data
 import octobot_trading.personal_data.orders as personal_data_orders
 import octobot_trading.util.test_tools.exchanges_test_tools as exchanges_test_tools
@@ -51,7 +54,20 @@ class AbstractAuthenticatedExchangeTester:
     ORDER_CURRENCY = "BTC"
     SETTLEMENT_CURRENCY = "USDT"
     SYMBOL = f"{ORDER_CURRENCY}/{SETTLEMENT_CURRENCY}"
+    TIME_FRAME = "1h"
     VALID_ORDER_ID = "8bb80a81-27f7-4415-aa50-911ea46d841c"
+    SPECIAL_ORDER_TYPES_BY_EXCHANGE_ID: dict[
+        str, (
+            str, # symbol
+            str, # order type key in 'info' dict
+            str, # order type found in 'info' dict
+            str, # parsed trading_enums.TradeOrderType
+            str, # parsed trading_enums.TradeOrderSide
+            bool, # trigger above (on higher price than order price)
+        )
+    ] = {}  # stop loss / take profit and other special order types to be successfully parsed
+    # details of an order that exists but can"t be cancelled
+    UNCANCELLABLE_ORDER_ID_SYMBOL_TYPE: tuple[str, str, trading_enums.TraderOrderType] = None
     ORDER_SIZE = 10  # % of portfolio to include in test orders
     PORTFOLIO_TYPE_FOR_SIZE = trading_constants.CONFIG_PORTFOLIO_FREE
     CONVERTS_ORDER_SIZE_BEFORE_PUSHING_TO_EXCHANGES = False
@@ -90,12 +106,17 @@ class AbstractAuthenticatedExchangeTester:
     CHECK_EMPTY_ACCOUNT = False  # set True when the account to check has no funds. Warning: does not check order
     # parse/create/fill/cancel or portfolio & trades parsing
     IS_BROKER_ENABLED_ACCOUNT = True # set False when this test account can't generate broker fees
+    # set True when this exchange used to have symbols that can't be traded through API (ex: MEXC)
+    USED_TO_HAVE_UNTRADABLE_SYMBOL = False
 
     # Implement all "test_[name]" methods, call super() to run the test, pass to ignore it.
     # Override the "inner_test_[name]" method to override a test content.
     # Add method call to subclasses to be able to run them independently
 
     async def test_get_portfolio(self):
+        # encoded_a = _get_encoded_value("") # tool to get encoded values
+        # encoded_b = _get_encoded_value("")
+        # encoded_c = _get_encoded_value("")
         async with self.local_exchange_manager():
             await self.inner_test_get_portfolio()
 
@@ -110,13 +131,14 @@ class AbstractAuthenticatedExchangeTester:
             # check portfolio fetched with filtered markets (should be equal to the one with all markets)
             filtered_markets_portfolio = await self.get_portfolio()
             if self.EXPECT_BALANCE_FILTER_BY_MARKET_STATUS:
-                assert filtered_markets_portfolio == {
+                filtered = {
                     key: val
                     for key, val in all_markets_portfolio.items()
                     if key in symbols.parse_symbol(self.SYMBOL).base_and_quote()
                 }
+                assert filtered_markets_portfolio == filtered, f"{filtered_markets_portfolio=} != {filtered=}"
             else:
-                assert filtered_markets_portfolio == all_markets_portfolio
+                assert filtered_markets_portfolio == all_markets_portfolio, f"{filtered_markets_portfolio=} != {all_markets_portfolio=}"
 
     async def inner_test_get_portfolio(self):
         self.check_portfolio_content(await self.get_portfolio())
@@ -140,12 +162,114 @@ class AbstractAuthenticatedExchangeTester:
                 at_least_one_value = True
         assert at_least_one_value
 
+    async def test_untradable_symbols(self):
+        await self.inner_test_untradable_symbols()
+
+    async def inner_test_untradable_symbols(self):
+        if not self.USED_TO_HAVE_UNTRADABLE_SYMBOL:
+            # nothing to do
+            return
+        async with self.local_exchange_manager():
+            all_symbols = self.exchange_manager.exchange.get_all_available_symbols()
+            all_symbols_including_disabled = self.exchange_manager.exchange.get_all_available_symbols(active_only=False)
+            disabled = [
+                symbol
+                for symbol in all_symbols_including_disabled
+                if symbol not in all_symbols
+            ]
+            tradable_symbols = await self.exchange_manager.exchange.get_all_tradable_symbols()
+            assert len(all_symbols) > len(tradable_symbols)
+            untradable_symbols = [
+                symbol
+                for symbol in all_symbols
+                if symbol not in tradable_symbols
+                and symbol.endswith(f"/{self.SETTLEMENT_CURRENCY}")
+                and (
+                   symbols.parse_symbol(symbol).is_spot()
+                   if self.EXCHANGE_TYPE == trading_enums.ExchangeTypes.SPOT.value
+                   else symbols.parse_symbol(symbol).is_future()
+               )
+            ]
+            tradable_symbols = [
+                symbol
+                for symbol in all_symbols
+                if symbol in tradable_symbols
+                and symbol.endswith(f"/{self.SETTLEMENT_CURRENCY}")
+                and (
+                   symbols.parse_symbol(symbol).is_spot()
+                   if self.EXCHANGE_TYPE == trading_enums.ExchangeTypes.SPOT.value
+                   else symbols.parse_symbol(symbol).is_future()
+               )
+            ]
+            # has untradable symbols of this trading type
+            assert len(untradable_symbols) > 0
+            untradable = [untradable_symbols[0]]
+            if disabled:
+                print(f"Including {disabled[0]} disabled coin (from {len(disabled)} coins)")
+                untradable.append(disabled[0])
+            for untradable_symbol in untradable:
+                # Public data
+                # market status is available
+                assert ccxt_constants.CCXT_INFO in self.exchange_manager.exchange.get_market_status(untradable_symbol)
+                # fetching ohlcv is ok
+                assert len(
+                    await self.exchange_manager.exchange.get_symbol_prices(
+                        untradable_symbol, commons_enums.TimeFrames(self.TIME_FRAME)
+                    )
+                ) > 5
+                # fetching kline is ok
+                kline = await self.exchange_manager.exchange.get_kline_price(
+                    untradable_symbol, commons_enums.TimeFrames(self.TIME_FRAME)
+                )
+                assert len(kline) == 1
+                assert len(kline[0]) == 6
+                # fetching ticker is ok
+                ticker = await self.exchange_manager.exchange.get_price_ticker(untradable_symbol)
+                assert ticker
+                price = ticker[trading_enums.ExchangeConstantsTickersColumns.CLOSE.value]
+                assert price > 0
+                # fetching recent trades is ok
+                recent_trades = await self.exchange_manager.exchange.get_recent_trades(untradable_symbol)
+                assert len(recent_trades) > 1
+                # fetching order book is ok
+                order_book = await self.exchange_manager.exchange.get_order_book(untradable_symbol)
+                assert len(order_book[trading_enums.ExchangeConstantsOrderBookInfoColumns.ASKS.value]) > 0
+                # is in all tickers
+                all_tickers = await self.exchange_manager.exchange.get_all_currencies_price_ticker()
+                assert all_tickers[untradable_symbol][trading_enums.ExchangeConstantsTickersColumns.CLOSE.value] > 0
+                # Orders
+                # try creating & cancelling orders on 5 random tradable and untradable symbols
+                symbols_to_test = 5
+                tradable_stepper = random.randint(1, len(tradable_symbols) - 2)
+                tradable_indexes = [tradable_stepper * i for i in range(0, symbols_to_test)]
+                untradable_stepper = random.randint(1, len(untradable_symbols) - 2)
+                untradable_indexes = [untradable_stepper * i for i in range(0, symbols_to_test)]
+                to_test_symbols = [
+                    tradable_symbols[i % (len(tradable_symbols) - 1)] for i in tradable_indexes
+                ] + [
+                    untradable_symbols[i % (len(untradable_symbols) - 1)] for i in untradable_indexes
+                ]
+            for i, symbol in enumerate(to_test_symbols):
+                ticker = await self.exchange_manager.exchange.get_price_ticker(symbol)
+                price = ticker[trading_enums.ExchangeConstantsTickersColumns.CLOSE.value]
+                price = self.get_order_price(decimal.Decimal(str(price)), False, symbol=symbol)
+                size = self.get_order_size(
+                    await self.get_portfolio(), price, symbol=symbol,
+                    settlement_currency=self.SETTLEMENT_CURRENCY
+                )
+                buy_limit = await self.create_limit_order(
+                    price, size, trading_enums.TradeOrderSide.BUY,
+                    symbol=symbol
+                )
+                await self.cancel_order(buy_limit)
+                print(f"{i+1}/{len(to_test_symbols)} : {symbol} Create & cancel order OK")
+
     async def test_get_account_id(self):
         async with self.local_exchange_manager():
             await self.inner_test_get_account_id()
 
     async def inner_test_get_account_id(self):
-        if self.IS_AUTHENTICATED_REQUEST_CHECK_AVAILABLE:
+        if self.IS_ACCOUNT_ID_AVAILABLE:
             account_id = await self.exchange_manager.exchange.get_account_id()
             assert account_id
             assert isinstance(account_id, str)
@@ -261,8 +385,8 @@ class AbstractAuthenticatedExchangeTester:
             async with self.local_exchange_manager(use_invalid_creds=True):
                 created_exchange()
                 # should fail
-                await self.get_portfolio()
-                raise AssertionError("Did not raise")
+                portfolio = await self.get_portfolio()
+                raise AssertionError(f"Did not raise on invalid api keys, fetched portfolio: {portfolio}")
             # ensure self.local_exchange_manager did not raise
             created_exchange.assert_called_once()
 
@@ -277,16 +401,18 @@ class AbstractAuthenticatedExchangeTester:
             "_get_api_key_rights_using_order", mock.AsyncMock(side_effect=origin_get_api_key_rights_using_order)
         ) as _get_api_key_rights_using_order_mock:
             permissions = await self.exchange_manager.exchange_backend._get_api_key_rights()
-            assert len(permissions) > 0
-            assert trading_backend.enums.APIKeyRights.READING in permissions
-            assert trading_backend.enums.APIKeyRights.SPOT_TRADING in permissions
-            assert trading_backend.enums.APIKeyRights.FUTURES_TRADING in permissions
+            self._ensure_required_permissions(permissions)
             if self.USE_ORDER_OPERATION_TO_CHECK_API_KEY_RIGHTS:
                 # failed ? did not use _get_api_key_rights_using_order while expected
                 _get_api_key_rights_using_order_mock.assert_called_once()
             else:
                 # failed ? used _get_api_key_rights_using_order when not expected
                 _get_api_key_rights_using_order_mock.assert_not_called()
+
+    def _ensure_required_permissions(self, permissions):
+        assert len(permissions) > 0
+        assert trading_backend.enums.APIKeyRights.READING in permissions
+        assert trading_backend.enums.APIKeyRights.SPOT_TRADING in permissions
 
     async def test_missing_trading_api_key_permissions(self):
         async with self.local_exchange_manager(identifiers_suffix="_READONLY"):
@@ -301,6 +427,19 @@ class AbstractAuthenticatedExchangeTester:
             await self.inner_test_create_and_cancel_limit_orders()
         # ensure AuthenticationError is raised when creating order
         assert "inner_test_create_and_cancel_limit_orders#create_limit_order" in str(err)
+
+    async def test_api_key_ip_whitelist_error(self):
+        if not self._supports_ip_whitelist_error():
+            return
+        with pytest.raises(trading_errors.InvalidAPIKeyIPWhitelistError):
+            created_exchange = mock.Mock()
+            async with self.local_exchange_manager(identifiers_suffix="_INVALID_IP_WHITELIST"):
+                created_exchange()
+                # should fail
+                portfolio = await self.get_portfolio()
+                raise AssertionError(f"Did not raise on invalid IP whitelist error, fetched portfolio: {portfolio}")
+            # ensure self.local_exchange_manager did not raise
+            created_exchange.assert_called_once()
 
     async def test_get_not_found_order(self):
         async with self.local_exchange_manager():
@@ -326,8 +465,53 @@ class AbstractAuthenticatedExchangeTester:
             assert isinstance(error, str)
             assert len(error) > 0
 
+
+    async def test_get_special_orders(self):
+        if self.SPECIAL_ORDER_TYPES_BY_EXCHANGE_ID:
+            async with self.local_exchange_manager():
+                await self.inner_test_get_special_orders()
+
+    async def inner_test_get_special_orders(self):
+        # open_orders = await self.get_open_orders(_symbols=["TAO/USDT"])
+        # print(open_orders)  # to print special orders when they are open
+        # return
+        for exchange_id, order_details in self.SPECIAL_ORDER_TYPES_BY_EXCHANGE_ID.items():
+            symbol, info_key, info_type, expected_type, expected_side, expected_trigger_above = order_details
+            fetched_order = await self.exchange_manager.exchange.get_order(exchange_id, symbol=symbol)
+            assert fetched_order is not None
+            self._check_fetched_order_dicts([fetched_order])
+            # ensure parsing order doesn't crash
+            parsed = personal_data.create_order_instance_from_raw(self.exchange_manager.trader, fetched_order)
+            assert isinstance(parsed, personal_data.Order)
+
+            assert fetched_order[trading_enums.ExchangeConstantsOrderColumns.SYMBOL.value] == symbol
+            found_type = fetched_order[ccxt_constants.CCXT_INFO][info_key]
+            assert found_type == info_type, f"[{exchange_id}]: {found_type} != {info_type}"
+            parsed_type = fetched_order[trading_enums.ExchangeConstantsOrderColumns.TYPE.value]
+            assert parsed_type == expected_type, f"[{exchange_id}]: {parsed_type} != {expected_type}"
+            assert fetched_order[trading_enums.ExchangeConstantsOrderColumns.SIDE.value] == expected_side
+            if expected_trigger_above is None:
+                assert trading_enums.ExchangeConstantsOrderColumns.TRIGGER_ABOVE.value not in fetched_order
+            else:
+                parsed_trigger_above = fetched_order[trading_enums.ExchangeConstantsOrderColumns.TRIGGER_ABOVE.value]
+                assert parsed_trigger_above == expected_trigger_above, (
+                    f"[{exchange_id}]: {parsed_trigger_above} != {expected_trigger_above}"
+                )
+                if isinstance(parsed, personal_data.LimitOrder):
+                    assert parsed.trigger_above == parsed_trigger_above
+            if expected_type == trading_enums.TradeOrderType.LIMIT.value:
+                assert fetched_order[trading_enums.ExchangeConstantsOrderColumns.PRICE.value] > 0
+            elif expected_type == trading_enums.TradeOrderType.STOP_LOSS.value:
+                assert fetched_order[trading_enums.ExchangeConstantsOrderColumns.STOP_PRICE.value] > 0
+            elif expected_type == trading_enums.TradeOrderType.UNSUPPORTED.value:
+                assert isinstance(parsed, personal_data.UnsupportedOrder)
+            else:
+                # ensure all cases are covered, otherwise there is a problem in order type parsing
+                assert expected_type == trading_enums.TradeOrderType.MARKET
+
     async def test_create_and_cancel_limit_orders(self):
         async with self.local_exchange_manager():
+            await self.inner_test_cancel_uncancellable_order()
             await self.inner_test_create_and_cancel_limit_orders()
 
     async def inner_test_create_and_cancel_limit_orders(self, symbol=None, settlement_currency=None, margin_type=None):
@@ -394,6 +578,12 @@ class AbstractAuthenticatedExchangeTester:
             await self.cancel_order(buy_limit)
         assert await self.order_not_in_open_orders(open_orders, buy_limit, symbol=symbol)
         assert await self.order_in_cancelled_orders(cancelled_orders, buy_limit, symbol=symbol)
+
+    async def inner_test_cancel_uncancellable_order(self):
+        if self.UNCANCELLABLE_ORDER_ID_SYMBOL_TYPE:
+            order_id, symbol, order_type = self.UNCANCELLABLE_ORDER_ID_SYMBOL_TYPE
+            with pytest.raises(trading_errors.ExchangeOrderCancelError):
+                await self.exchange_manager.exchange.cancel_order(order_id, symbol, order_type)
 
     async def test_create_and_fill_market_orders(self):
         async with self.local_exchange_manager():
@@ -746,12 +936,12 @@ class AbstractAuthenticatedExchangeTester:
     async def get_closed_orders(self, symbol=None):
         return await self.exchange_manager.exchange.get_closed_orders(symbol or self.SYMBOL)
 
-    async def get_cancelled_orders(self, exchange_data=None, force_fetch=False):
+    async def get_cancelled_orders(self, exchange_data=None, force_fetch=False, _symbols=None):
         if not force_fetch and not self.exchange_manager.exchange.SUPPORT_FETCHING_CANCELLED_ORDERS:
             # skipped
             return []
         exchange_data = exchange_data or self.get_exchange_data()
-        return await exchanges_test_tools.get_cancelled_orders(self.exchange_manager, exchange_data)
+        return await exchanges_test_tools.get_cancelled_orders(self.exchange_manager, exchange_data, symbols=_symbols)
 
     async def check_require_closed_orders_from_recent_trades(self, symbol=None):
         if self.exchange_manager.exchange.REQUIRE_CLOSED_ORDERS_FROM_RECENT_TRADES:
@@ -899,29 +1089,6 @@ class AbstractAuthenticatedExchangeTester:
                 trading_enums.ExchangeConstantsTickersColumns.CLOSE.value
             ]
         ))
-
-    @contextlib.asynccontextmanager
-    async def local_exchange_manager(
-        self, market_filter=None, identifiers_suffix=None, use_invalid_creds=False, http_proxy_callback_factory=None
-    ):
-        try:
-            exchange_tentacle_name = self.EXCHANGE_TENTACLE_NAME or self.EXCHANGE_NAME.capitalize()
-            credentials_exchange_name = self.CREDENTIALS_EXCHANGE_NAME or self.EXCHANGE_NAME
-            if identifiers_suffix:
-                credentials_exchange_name = f"{credentials_exchange_name}{identifiers_suffix}"
-            async with get_authenticated_exchange_manager(
-                    self.EXCHANGE_NAME,
-                    exchange_tentacle_name,
-                    self.get_config(),
-                    credentials_exchange_name=credentials_exchange_name,
-                    market_filter=market_filter,
-                    use_invalid_creds=use_invalid_creds,
-                    http_proxy_callback_factory=http_proxy_callback_factory,
-            ) as exchange_manager:
-                self.exchange_manager = exchange_manager
-                yield
-        finally:
-            self.exchange_manager = None
 
     async def get_order(self, exchange_order_id, symbol=None):
         assert self.exchange_manager.exchange.connector.client.has["fetchOrder"] is \
@@ -1087,9 +1254,9 @@ class AbstractAuthenticatedExchangeTester:
             price * (decimal.Decimal(str(multiplier)))
         )
 
-    async def get_open_orders(self, exchange_data=None):
+    async def get_open_orders(self, exchange_data=None, _symbols=None):
         exchange_data = exchange_data or self.get_exchange_data()
-        orders = await exchanges_test_tools.get_open_orders(self.exchange_manager, exchange_data)
+        orders = await exchanges_test_tools.get_open_orders(self.exchange_manager, exchange_data, symbols=_symbols)
         self.check_duplicate(orders)
         self._check_fetched_order_dicts(orders)
         return orders
@@ -1329,7 +1496,7 @@ class AbstractAuthenticatedExchangeTester:
     async def cancel_order(self, order):
         cancelled_order = order
         if not await self.exchange_manager.trader.cancel_order(order, wait_for_cancelling=False):
-            raise AssertionError("cancel_order returned False")
+            raise AssertionError(f"cancel_order returned False ({order.symbol})")
         if order.status is trading_enums.OrderStatus.PENDING_CANCEL:
             cancelled_order = await self.wait_for_cancel(order)
         assert cancelled_order.status is trading_enums.OrderStatus.CANCELED
@@ -1361,7 +1528,7 @@ class AbstractAuthenticatedExchangeTester:
             exchange_details={"name": self.exchange_manager.exchange_name},
             markets=[
                 {
-                    "id": s, "symbol": s, "info": {}, "time_frame": "1h",
+                    "id": s, "symbol": s, "info": {}, "time_frame": self.TIME_FRAME,
                     "close": [0], "open": [0], "high": [0], "low": [0], "volume": [0], "time": [0]  # todo
                 }
                 for s in _symbols
@@ -1376,3 +1543,38 @@ class AbstractAuthenticatedExchangeTester:
             )
 
         return market_filter
+
+    @contextlib.asynccontextmanager
+    async def local_exchange_manager(
+        self, market_filter=None, identifiers_suffix=None, use_invalid_creds=False, http_proxy_callback_factory=None
+    ):
+        try:
+            credentials_exchange_name = self.CREDENTIALS_EXCHANGE_NAME or self.EXCHANGE_NAME
+            if identifiers_suffix:
+                credentials_exchange_name = f"{credentials_exchange_name}{identifiers_suffix}"
+            async with get_authenticated_exchange_manager(
+                    self.EXCHANGE_NAME,
+                    self._get_exchange_tentacle_name(),
+                    self.get_config(),
+                    credentials_exchange_name=credentials_exchange_name,
+                    market_filter=market_filter,
+                    use_invalid_creds=use_invalid_creds,
+                    http_proxy_callback_factory=http_proxy_callback_factory,
+            ) as exchange_manager:
+                self.exchange_manager = exchange_manager
+                yield
+        finally:
+            self.exchange_manager = None
+
+    def _get_exchange_tentacle_name(self):
+        return self.EXCHANGE_TENTACLE_NAME or self.EXCHANGE_NAME.capitalize()
+
+    def _get_exchange_tentacle_class(self):
+        return tentacles_manager_api.get_tentacle_class_from_string(self._get_exchange_tentacle_name())
+
+    def _supports_ip_whitelist_error(self):
+        return bool(self._get_exchange_tentacle_class().EXCHANGE_IP_WHITELIST_ERRORS)
+
+
+def _get_encoded_value(raw) -> str:
+    return commons_configuration.encrypt(raw).decode()

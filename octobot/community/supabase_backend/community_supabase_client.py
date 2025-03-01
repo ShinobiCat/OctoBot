@@ -122,7 +122,7 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
     async def sign_out(self, options: gotrue.types.SignOutOptions) -> None:
         try:
             await self.auth.sign_out(options)
-        except gotrue.errors.AuthApiError:
+        except (postgrest.exceptions.APIError, gotrue.errors.AuthApiError):
             pass
 
     def _requires_email_validation(self, user: gotrue.types.User) -> bool:
@@ -137,7 +137,7 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
     async def refresh_session(self, refresh_token: typing.Union[str, None] = None):
         try:
             await self.auth.refresh_session(refresh_token=refresh_token)
-        except gotrue.errors.AuthError as err:
+        except (postgrest.exceptions.APIError, gotrue.errors.AuthError) as err:
             raise authentication.AuthenticationError(f"Community auth error: {err}") from err
 
     async def sign_in_with_otp_token(self, token):
@@ -229,16 +229,21 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
         return json.loads(json.loads(resp)["message"])
 
     async def fetch_bot(self, bot_id) -> dict:
-        try:
-            # https://postgrest.org/en/stable/references/api/resource_embedding.html#hint-disambiguation
-            return (await self.table("bots").select("*,bot_deployment:bot_deployments!bots_current_deployment_id_fkey(*)").eq(
-                enums.BotKeys.ID.value, bot_id
-            ).execute()).data[0]
-        except IndexError:
-            raise errors.BotNotFoundError(f"Can't find bot with id: {bot_id}")
+        with jwt_expired_auth_raiser():
+            try:
+                # https://postgrest.org/en/stable/references/api/resource_embedding.html#hint-disambiguation
+                return (await self.table("bots").select("*,bot_deployment:bot_deployments!bots_current_deployment_id_fkey(*)").eq(
+                    enums.BotKeys.ID.value, bot_id
+                ).execute()).data[0]
+            except IndexError:
+                raise errors.BotNotFoundError(f"Can't find bot with id: {bot_id}")
 
     async def fetch_bots(self) -> list:
-        return (await self.table("bots").select("*,bot_deployment:bot_deployments!bots_current_deployment_id_fkey!inner(*)").execute()).data
+        with jwt_expired_auth_raiser():
+            return (
+                await self.table("bots").select(
+                    "*,bot_deployment:bot_deployments!bots_current_deployment_id_fkey!inner(*)"
+                ).execute()).data
 
     async def create_bot(self, deployment_type: enums.DeploymentTypes) -> dict:
         created_bot = (await self.table("bots").insert({
@@ -305,19 +310,23 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
         return resp.data[0]
 
     async def fetch_products(self, category_types: list[str]) -> list:
-        return (
-            await self.table("products").select(
-                "*,"
-                "category:product_categories!inner(slug, name_translations, type, metadata),"
-                "results:product_results!products_current_result_id_fkey("
-                "  profitability,"
-                "  reference_market_profitability"
-                ")"
-            ).eq(
-                enums.ProductKeys.VISIBILITY.value, "public"
-            ).in_("category.type", category_types)
-            .execute()
-        ).data
+        try:
+            return (
+                await self.table("products").select(
+                    "*,"
+                    "category:product_categories!inner(slug, name_translations, type, metadata),"
+                    "results:product_results!products_current_result_id_fkey("
+                    "  profitability,"
+                    "  reference_market_profitability"
+                    ")"
+                ).eq(
+                    enums.ProductKeys.VISIBILITY.value, "public"
+                ).in_("category.type", category_types)
+                .execute()
+            ).data
+        except postgrest.exceptions.APIError as err:
+            commons_logging.get_logger(__name__).error(f"Error when fetching products: {err}")
+            return []
 
     async def fetch_subscribed_products_urls(self) -> list:
         resp = await self.rpc("get_subscribed_products_urls").execute()
@@ -428,9 +437,10 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
             ")"
         ).eq(enums.BotConfigKeys.ID.value, bot_config_id).execute()).data[0]
         try:
-            profile_data = commons_profiles.ProfileData.from_dict(
-                bot_config["product_config"][enums.ProfileConfigKeys.CONFIG.value]
-            )
+            profile_config = bot_config["product_config"][enums.ProfileConfigKeys.CONFIG.value]
+            if not profile_config:
+                raise TypeError(f"product_config.config is '{profile_config}'")
+            profile_data = commons_profiles.ProfileData.from_dict(profile_config)
         except (TypeError, KeyError) as err:
             raise errors.InvalidBotConfigError(f"Missing bot product config: {err} ({err.__class__.__name__})") from err
         profile_data.profile_details.name = bot_config["product_config"].get("product", {}).get(
@@ -751,19 +761,25 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
         self, client, table_name: str, select: str, matcher: dict,
         first_open_time: float, last_open_time: float
     ) -> list:
-        def request_factory(table: postgrest.AsyncRequestBuilder, select_count):
-            return (
-                table.select(select, count=select_count)
-                .match(matcher).gte(
+        def request_factory(table: postgrest.AsyncRequestBuilder, select_count, last_fetched_row):
+            request = table.select(select, count=select_count)
+            if last_fetched_row is None:
+                request = request.match(matcher).gte(
                     "timestamp", self.get_formatted_time(first_open_time)
-                ).lte(
+                )
+            else:
+                request = request.match(matcher).gt(
+                    "timestamp", last_fetched_row["timestamp"]
+                )
+            return (
+                request.lte(
                     "timestamp", self.get_formatted_time(last_open_time)
                 ).order(
                     "timestamp", desc=False
                 )
             )
 
-        return await self.paginated_fetch(
+        return await self.cursor_paginated_fetch(
             client, table_name, request_factory
         )
 
@@ -801,6 +817,47 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
             offset += len(fetched_elements)
             if max_size_per_fetch == 0:
                 max_size_per_fetch = offset
+            request_count += 1
+
+        if request_count == self.MAX_PAGINATED_REQUESTS_COUNT:
+            commons_logging.get_logger(self.__class__.__name__).info(
+                f"Paginated fetch error on {table_name} with request_factory: {request_factory.__name__}: "
+                f"too many requests ({request_count}), fetched: {len(total_elements)} elements"
+            )
+        return total_elements
+
+    async def cursor_paginated_fetch(
+        self,
+        client,
+        table_name: str,
+        request_factory: typing.Callable[
+            [postgrest.AsyncRequestBuilder, postgrest.types.CountMethod, typing.Optional[dict]],
+            postgrest.AsyncSelectRequestBuilder
+        ],
+    ) -> list:
+        max_size_per_fetch = 0
+        total_elements = []
+        request_count = 0
+        total_elements_count = 0
+        while request_count < self.MAX_PAGINATED_REQUESTS_COUNT:
+            request = request_factory(
+                client.table(table_name),
+                None if total_elements_count else postgrest.types.CountMethod.exact,
+                total_elements[-1] if total_elements else None
+            )
+            result = await request.execute()
+            fetched_elements = result.data
+            total_elements_count = total_elements_count or result.count   # don't change total count within iteration
+            total_elements += fetched_elements
+            if(
+                len(fetched_elements) == 0 or   # nothing to fetch
+                len(fetched_elements) < max_size_per_fetch or   # fetched the last elements
+                len(fetched_elements) == total_elements_count   # finished fetching
+            ):
+                # fetched everything
+                break
+            if max_size_per_fetch == 0:
+                max_size_per_fetch = len(fetched_elements)
             request_count += 1
 
         if request_count == self.MAX_PAGINATED_REQUESTS_COUNT:
@@ -862,7 +919,7 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
         Not implemented for authenticated users
         """
         result = await self.storage.from_(bucket_name).upload(asset_name, content)
-        return result.json()["Id"]
+        return result.path
 
     async def list_assets(self, bucket_name: str) -> list[dict[str, str]]:
         """
@@ -870,11 +927,11 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
         """
         return await self.storage.from_(bucket_name).list()
 
-    async def remove_asset(self, bucket_name: str, asset_name: str) -> None:
+    async def remove_asset(self, bucket_name: str, asset_path: str) -> None:
         """
         Not implemented for authenticated users
         """
-        await self.storage.from_(bucket_name).remove(asset_name)
+        await self.storage.from_(bucket_name).remove([asset_path])
 
     async def send_signal(self, table, product_id: str, signal: str):
         return (await self.table(table).insert({
@@ -935,3 +992,13 @@ class CommunitySupabaseClient(supabase_client.AuthenticatedAsyncSupabaseClient):
                 # happens when the event loop is closed already
                 pass
             self.production_anon_client = None
+
+
+@contextlib.contextmanager
+def jwt_expired_auth_raiser():
+    try:
+        yield
+    except postgrest.exceptions.APIError as err:
+        if "JWT expired" in str(err):
+            raise authentication.AuthenticationError(f"Please re-login to your OctoBot account: {err}") from err
+        raise

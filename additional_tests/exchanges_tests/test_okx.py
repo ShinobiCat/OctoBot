@@ -45,11 +45,17 @@ class TestOKXAuthenticatedExchange(
     async def test_is_valid_account(self):
         await super().test_is_valid_account()
 
+    async def test_get_special_orders(self):
+        await super().test_get_special_orders()
+
     async def test_create_and_cancel_limit_orders(self):
         await super().test_create_and_cancel_limit_orders()
 
     async def test_get_account_id(self):
         await super().test_get_account_id()
+
+    async def test_untradable_symbols(self):
+        await super().test_untradable_symbols()
 
     async def test_is_authenticated_request(self):
         await super().test_is_authenticated_request()
@@ -62,6 +68,9 @@ class TestOKXAuthenticatedExchange(
 
     async def test_missing_trading_api_key_permissions(self):
         pass
+
+    async def test_api_key_ip_whitelist_error(self):
+        await super().test_api_key_ip_whitelist_error()
 
     async def test_get_not_found_order(self):
         await super().test_get_not_found_order()
